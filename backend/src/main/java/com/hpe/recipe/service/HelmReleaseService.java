@@ -78,6 +78,7 @@ public class HelmReleaseService {
         copy.setCatalogReleaseDate(source.getCatalogReleaseDate());
         copy.setCatalogStatus(source.getCatalogStatus());
         copy.setMaintainer(source.getMaintainer());
+        copy.setValuesFileName(source.getValuesFileName());
 
         List<Recipe> copiedRecipes = new ArrayList<>();
         if (source.getRecipes() != null) {
@@ -151,6 +152,7 @@ public class HelmReleaseService {
             String catalogReleaseDate = root.has("release_date") ? root.get("release_date").asText() : "";
             String catalogStatus = root.has("catalog_status") ? root.get("catalog_status").asText() : "";
             String maintainer = root.has("maintainer") ? root.get("maintainer").asText() : "";
+            String valuesFileName = root.has("values_file") ? root.get("values_file").asText() : "";
 
             List<Recipe> recipes = new ArrayList<>();
             Map<String, List<String>> legacyFromByTarget = new LinkedHashMap<>();
@@ -239,7 +241,7 @@ public class HelmReleaseService {
                 }
             }
 
-                return new HelmRelease(
+                HelmRelease parsedRelease = new HelmRelease(
                     version,
                     releaseName,
                     status,
@@ -250,6 +252,10 @@ public class HelmReleaseService {
                     catalogStatus,
                     maintainer,
                     recipes);
+                if (!valuesFileName.isBlank()) {
+                    parsedRelease.setValuesFileName(valuesFileName);
+                }
+                return parsedRelease;
 
         } catch (Exception e) {
             log.warn("Parse error: {}", e.getMessage());
@@ -891,6 +897,181 @@ public class HelmReleaseService {
 
         } catch (Exception e) {
             return "{}";
+        }
+    }
+
+
+    public HelmRelease getDeployedFromCluster(String cluster, String version) {
+        for (ConfigMap cm : fetchRecipeConfigMaps(cluster)) {
+            if (!isHelmManaged(cm)) {
+                continue;
+            }
+            HelmRelease parsed = parseConfigMap(cluster, cm);
+            if (parsed != null && version.equals(parsed.getVersion())) {
+                HelmRelease copy = copyRelease(parsed);
+                copy.setCluster(cluster);
+                copy.setStatus("deployed");
+                return copy;
+            }
+        }
+        return null;
+    }
+
+    public List<HelmRelease> getDeployedHelmReleases(String cluster) {
+        List<HelmRelease> result = new ArrayList<>();
+        for (ConfigMap cm : fetchRecipeConfigMaps(cluster)) {
+            if (!isHelmManaged(cm)) {
+                continue;
+            }
+            HelmRelease parsed = parseConfigMap(cluster, cm);
+            if (parsed != null) {
+                HelmRelease copy = copyRelease(parsed);
+                copy.setCluster(cluster);
+                copy.setStatus("deployed");
+                result.add(copy);
+            }
+        }
+        result.sort((a, b) -> compareVersions(a.getVersion(), b.getVersion()));
+        return result;
+    }
+
+    public Optional<String> getLatestDeployedVersion(String cluster) {
+        List<HelmRelease> deployed = getDeployedHelmReleases(cluster);
+        if (deployed.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(deployed.get(deployed.size() - 1).getVersion());
+    }
+
+    public Optional<String> getPreviousDeployedVersion(String cluster, String currentVersion) {
+        List<String> versions = getDeployedHelmReleases(cluster).stream()
+                .map(HelmRelease::getVersion)
+                .collect(Collectors.toList());
+
+        int idx = versions.indexOf(currentVersion);
+        if (idx > 0) {
+            return Optional.of(versions.get(idx - 1));
+        }
+        if (idx < 0 && versions.size() >= 2) {
+            return Optional.of(versions.get(versions.size() - 2));
+        }
+        return Optional.empty();
+    }
+
+    public Map<String, Object> getDeployPreview(String cluster, String version, String baseline) {
+        HelmRelease proposed = getHelmRelease(cluster, version);
+        if (proposed == null) {
+            return Map.of("error", "Release not found");
+        }
+
+        String baselineVersion = resolveBaselineVersion(cluster, version, baseline);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("cluster", cluster);
+        result.put("targetVersion", version);
+        result.put("baselineVersion", baselineVersion != null ? baselineVersion : "");
+        result.put("isNewDeploy", baselineVersion == null);
+
+        if (baselineVersion == null) {
+            result.put("recipesAdded", List.of());
+            result.put("recipesRemoved", List.of());
+            result.put("recipesChanged", List.of());
+            result.put("hasChanges", !safeRecipes(proposed).isEmpty());
+            result.put("summary", "First deploy to this cluster — no previous Helm release to compare against.");
+            return result;
+        }
+
+        Map<String, Object> diff = getUpgradePathsBetweenHelmVersions(cluster, baselineVersion, version);
+        result.putAll(diff);
+        result.put("hasChanges", hasRecipeDiffs(diff));
+        result.put("summary", hasRecipeDiffs(diff)
+                ? "Changes detected versus currently deployed v" + baselineVersion + "."
+                : "No recipe differences versus currently deployed v" + baselineVersion + ".");
+        return result;
+    }
+
+    public Map<String, Object> getRollbackOptions(String cluster, String version) {
+        List<HelmRelease> deployed = getDeployedHelmReleases(cluster);
+        List<Map<String, String>> available = new ArrayList<>();
+
+        for (HelmRelease release : deployed) {
+            Map<String, String> entry = new LinkedHashMap<>();
+            entry.put("version", release.getVersion());
+            entry.put("releaseName", release.getReleaseName() != null ? release.getReleaseName() : "");
+            available.add(entry);
+        }
+
+        Collections.reverse(available);
+
+        String previousVersion = getPreviousDeployedVersion(cluster, version).orElse("");
+        boolean canRevisionRollback = getDeployedFromCluster(cluster, version) != null;
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("cluster", cluster);
+        result.put("version", version);
+        result.put("previousVersion", previousVersion);
+        result.put("availableVersions", available);
+        result.put("canHelmRevisionRollback", canRevisionRollback);
+        return result;
+    }
+
+    private String resolveBaselineVersion(String cluster, String version, String baseline) {
+        if (baseline != null && ("none".equalsIgnoreCase(baseline) || "new".equalsIgnoreCase(baseline))) {
+            return null;
+        }
+        if (baseline != null && !baseline.isBlank()
+                && !"latest".equalsIgnoreCase(baseline)
+                && !"auto".equalsIgnoreCase(baseline)) {
+            return getHelmRelease(cluster, baseline) != null || getDeployedFromCluster(cluster, baseline) != null
+                    ? baseline
+                    : null;
+        }
+
+        HelmRelease deployedTarget = getDeployedFromCluster(cluster, version);
+        if (deployedTarget != null) {
+            return version;
+        }
+
+        Optional<String> latest = getLatestDeployedVersion(cluster);
+        if (latest.isPresent() && !latest.get().equals(version)) {
+            return latest.get();
+        }
+
+        return null;
+    }
+
+    private boolean hasRecipeDiffs(Map<String, Object> diff) {
+        return !asList(diff.get("recipesAdded")).isEmpty()
+                || !asList(diff.get("recipesRemoved")).isEmpty()
+                || !asList(diff.get("recipesChanged")).isEmpty();
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Object> asList(Object value) {
+        if (value instanceof List<?> list) {
+            return (List<Object>) list;
+        }
+        return Collections.emptyList();
+    }
+
+    int compareVersions(String a, String b) {
+        String[] partsA = a.split("\\.");
+        String[] partsB = b.split("\\.");
+        int len = Math.max(partsA.length, partsB.length);
+        for (int i = 0; i < len; i++) {
+            int numA = i < partsA.length ? parseVersionPart(partsA[i]) : 0;
+            int numB = i < partsB.length ? parseVersionPart(partsB[i]) : 0;
+            if (numA != numB) {
+                return Integer.compare(numA, numB);
+            }
+        }
+        return 0;
+    }
+
+    private int parseVersionPart(String part) {
+        try {
+            return Integer.parseInt(part.replaceAll("[^0-9].*", ""));
+        } catch (NumberFormatException e) {
+            return 0;
         }
     }
 }

@@ -2,7 +2,11 @@ pipeline {
     agent any
 
     parameters {
-        choice(name: 'CLUSTER', choices: ['dev', 'prod', 'qa', 'integration'], description: 'Select target cluster')
+        choice(name: 'ALLOW_DEPLOY', choices: ['no', 'yes'], description: 'Must be yes to run Helm deploy/rollback. SCM builds default to no.')
+        choice(name: 'CLUSTER', choices: ['dev', 'prod', 'qa', 'integration'], description: 'Target cluster for deploy/rollback')
+        choice(name: 'ACTION', choices: ['deploy', 'rollback', 'helm-rollback'], description: 'deploy = install/upgrade, rollback = redeploy older values file, helm-rollback = undo last Helm revision')
+        string(name: 'CHART_VERSION', defaultValue: '', description: 'Optional chart version override')
+        string(name: 'VALUES_FILE', defaultValue: '', description: 'Optional values file name override (e.g. prod-values.yaml)')
     }
 
     environment {
@@ -20,7 +24,19 @@ pipeline {
             }
         }
 
+        stage('SCM-only build') {
+            when {
+                expression { params.ALLOW_DEPLOY != 'yes' }
+            }
+            steps {
+                echo 'ALLOW_DEPLOY=no — skipping Helm changes. Deploy only via UI/API trigger with ALLOW_DEPLOY=yes.'
+            }
+        }
+
         stage('Validate Cluster Access') {
+            when {
+                expression { params.ALLOW_DEPLOY == 'yes' }
+            }
             steps {
                 script {
                     if (isUnix()) {
@@ -29,33 +45,98 @@ pipeline {
                         bat "kubectl --context=${params.CLUSTER} get nodes"
                     }
                     echo "Using cluster: ${params.CLUSTER}"
+                    echo "Action: ${params.ACTION}"
                 }
             }
         }
 
         stage('Determine Chart Version') {
+            when {
+                expression { params.ALLOW_DEPLOY == 'yes' }
+            }
             steps {
                 script {
-                    def chartYaml = readFile("${CHART_DIR}/Chart.yaml")
-                    def versionLine = chartYaml.readLines().find { it.startsWith('version:') }
+                    if (params.CHART_VERSION?.trim()) {
+                        env.CHART_VERSION = params.CHART_VERSION.trim()
+                    } else {
+                        def chartYaml = readFile("${CHART_DIR}/Chart.yaml")
+                        def versionLine = chartYaml.readLines().find { it.startsWith('version:') }
+                        env.CHART_VERSION = versionLine.split(':')[1].trim()
+                    }
 
-                    env.CHART_VERSION = versionLine.split(':')[1].trim()
                     env.RELEASE_NAME = "recipe-${params.CLUSTER}-v${env.CHART_VERSION.replace('.', '-')}"
 
-                    env.VALUES_FILE = "${CHART_DIR}/values-v${env.CHART_VERSION}.yaml"
+                    def valuesFileName = ''
+                    if (params.VALUES_FILE?.trim()) {
+                        valuesFileName = params.VALUES_FILE.trim()
+                    } else {
+                        def chartYaml = readFile("${CHART_DIR}/Chart.yaml")
+                        def annotationMatcher = (chartYaml =~ /(?m)^\s*recipe-detection\/values-file:\s*(\S+)/)
+                        if (annotationMatcher.find()) {
+                            valuesFileName = annotationMatcher.group(1)
+                        } else {
+                            valuesFileName = "values-v${env.CHART_VERSION}.yaml"
+                        }
+                    }
+
+                    env.VALUES_FILE = "${CHART_DIR}/${valuesFileName}"
                     env.HAS_VERSION_VALUES = fileExists(env.VALUES_FILE) ? 'true' : 'false'
 
                     echo "Chart Version: ${env.CHART_VERSION}"
+                    echo "Values File: ${env.VALUES_FILE}"
                     echo "Release Name: ${env.RELEASE_NAME}"
                 }
             }
         }
 
-        stage('Deploy Helm (Config Only)') {
+        stage('Validate Target Cluster') {
+            when {
+                expression { params.ALLOW_DEPLOY == 'yes' && (params.ACTION == 'deploy' || params.ACTION == 'rollback') }
+            }
             steps {
                 script {
-                    def valuesArg = env.HAS_VERSION_VALUES == 'true'
-                        ? "-f ${env.VALUES_FILE}" : ""
+                    if (env.HAS_VERSION_VALUES != 'true') {
+                        error "Values file not found: ${env.VALUES_FILE}"
+                    }
+
+                    def valuesContent = readFile(env.VALUES_FILE)
+                    def matcher = (valuesContent =~ /(?m)^\s*target_cluster:\s*['"]?([A-Za-z0-9_-]+)['"]?\s*$/)
+                    if (matcher.find()) {
+                        def targetCluster = matcher.group(1)
+                        echo "Values file target_cluster: ${targetCluster}"
+                        if (targetCluster != params.CLUSTER) {
+                            error "Cluster mismatch: values file targets '${targetCluster}' but CLUSTER parameter is '${params.CLUSTER}'"
+                        }
+                    } else {
+                        echo 'WARNING: values file has no target_cluster field (legacy release). Proceeding with CLUSTER parameter.'
+                    }
+                }
+            }
+        }
+
+        stage('Helm Revision Rollback') {
+            when {
+                expression { params.ALLOW_DEPLOY == 'yes' && params.ACTION == 'helm-rollback' }
+            }
+            steps {
+                script {
+                    if (isUnix()) {
+                        sh "${HELM_CMD} --kube-context ${params.CLUSTER} rollback ${RELEASE_NAME} --namespace ${KUBE_NAMESPACE}"
+                    } else {
+                        bat "${HELM_CMD} --kube-context ${params.CLUSTER} rollback ${RELEASE_NAME} --namespace ${KUBE_NAMESPACE}"
+                    }
+                    echo "Rolled back Helm revision for: ${RELEASE_NAME}"
+                }
+            }
+        }
+
+        stage('Deploy Helm (Config Only)') {
+            when {
+                expression { params.ALLOW_DEPLOY == 'yes' && (params.ACTION == 'deploy' || params.ACTION == 'rollback') }
+            }
+            steps {
+                script {
+                    def valuesArg = "-f ${env.VALUES_FILE}"
 
                     def releaseExists
                     if (isUnix()) {
@@ -98,6 +179,9 @@ pipeline {
         }
 
         stage('Verify ConfigMap') {
+            when {
+                expression { params.ALLOW_DEPLOY == 'yes' && (params.ACTION == 'deploy' || params.ACTION == 'rollback') }
+            }
             steps {
                 script {
                     if (isUnix()) {
@@ -112,6 +196,9 @@ pipeline {
         }
 
         stage('Update Backend Status') {
+            when {
+                expression { params.ALLOW_DEPLOY == 'yes' }
+            }
             steps {
                 script {
                     if (isUnix()) {
@@ -132,11 +219,17 @@ pipeline {
 
     post {
         success {
-            echo "Successfully deployed ${env.RELEASE_NAME} to ${params.CLUSTER}"
+            script {
+                if (params.ALLOW_DEPLOY == 'yes') {
+                    echo "Successfully completed ${params.ACTION} for ${env.RELEASE_NAME} on ${params.CLUSTER}"
+                } else {
+                    echo 'SCM validation build completed without cluster changes.'
+                }
+            }
         }
         failure {
             script {
-                if (env.CHART_VERSION) {
+                if (params.ALLOW_DEPLOY == 'yes' && env.CHART_VERSION) {
                     if (isUnix()) {
                         sh """
                             curl -s -X PUT ${API_URL}/helm-releases/${env.CHART_VERSION}/status?cluster=${params.CLUSTER} \\

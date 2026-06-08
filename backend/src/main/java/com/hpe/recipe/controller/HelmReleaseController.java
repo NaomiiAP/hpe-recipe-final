@@ -47,7 +47,7 @@ public class HelmReleaseController {
         this.gitOpsService = gitOpsService;
     }
 
-    // 🔥 GET ALL (cluster-specific)
+  
     @GetMapping
     public List<Map<String, String>> getAllHelmReleases(@RequestParam String cluster) {
 
@@ -73,7 +73,7 @@ public class HelmReleaseController {
         return lightweight;
     }
 
-    // 🔥 GET ONE
+    
     @GetMapping("/{version}")
     public ResponseEntity<HelmRelease> getHelmRelease(
             @PathVariable String version,
@@ -88,7 +88,7 @@ public class HelmReleaseController {
         return ResponseEntity.ok(release);
     }
 
-    // 🔥 CREATE
+   
     @PostMapping
     public ResponseEntity<HelmRelease> createHelmRelease(
             @RequestParam String cluster,
@@ -106,7 +106,7 @@ public class HelmReleaseController {
         return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
-    // 🔥 UPDATE
+   
     @PutMapping("/{version}")
     public ResponseEntity<HelmRelease> updateHelmRelease(
             @PathVariable String version,
@@ -123,7 +123,7 @@ public class HelmReleaseController {
         return ResponseEntity.ok(updated);
     }
 
-    // 🔥 UPDATE STATUS
+    
     @PutMapping("/{version}/status")
     public ResponseEntity<HelmRelease> updateStatus(
             @PathVariable String version,
@@ -154,7 +154,7 @@ public class HelmReleaseController {
         return ResponseEntity.ok(release);
     }
 
-    // 🔥 DEPLOY
+  
     @PostMapping("/{version}/deploy")
     public ResponseEntity<?> deployRelease(
             @PathVariable String version,
@@ -169,6 +169,7 @@ public class HelmReleaseController {
                     .body(Map.of("error", "Cannot deploy release with no recipes"));
         }
 
+        release.setCluster(cluster);
         release.setStatus("deploying");
         helmReleaseService.updateHelmRelease(cluster, version, release);
 
@@ -176,9 +177,9 @@ public class HelmReleaseController {
                 Map.of("version", version, "status", "deploying", "cluster", cluster));
 
         try {
+            String valuesFileName = gitOpsService.resolveValuesFileName(release);
             gitOpsService.generateAndPush(release);
-            // 🔥 NEW: Trigger Jenkins with cluster
-            triggerJenkins(cluster);
+            triggerJenkins(cluster, "deploy", release.getVersion(), valuesFileName);
 
             return ResponseEntity.ok(Map.of(
                     "message", "Pushed to Git. Jenkins will deploy shortly.",
@@ -199,7 +200,7 @@ public class HelmReleaseController {
         }
     }
 
-    // 🔥 DELETE
+   
     @DeleteMapping("/{version}")
     public ResponseEntity<Void> deleteHelmRelease(
             @PathVariable String version,
@@ -215,7 +216,6 @@ public class HelmReleaseController {
         return ResponseEntity.noContent().build();
     }
 
-    // 🔥 RECIPES
     @GetMapping("/{version}/recipes")
     public List<Recipe> getRecipes(
             @PathVariable String version,
@@ -271,7 +271,7 @@ public class HelmReleaseController {
         return ResponseEntity.noContent().build();
     }
 
-    // 🔥 COMPONENTS
+   
     @GetMapping("/{version}/recipes/{recipeVersion}/components")
     public Map<String, ComponentSpec> getComponents(
             @PathVariable String version,
@@ -281,7 +281,7 @@ public class HelmReleaseController {
         return helmReleaseService.getComponentsByRecipe(cluster, version, recipeVersion);
     }
 
-    // 🔥 UPGRADE PATHS
+    
     @GetMapping("/{version}/recipes/{recipeVersion}/upgradePaths")
     public List<String> getUpgradePaths(
             @PathVariable String version,
@@ -291,7 +291,7 @@ public class HelmReleaseController {
         return helmReleaseService.getUpgradePaths(cluster, version, recipeVersion);
     }
 
-    // 🔥 COMPARE (cluster-specific)
+   
     @GetMapping("/compare")
     public Map<String, Object> compareHelmVersions(
             @RequestParam String cluster,
@@ -301,7 +301,105 @@ public class HelmReleaseController {
         return helmReleaseService.getUpgradePathsBetweenHelmVersions(cluster, from, to);
     }
 
-    private void triggerJenkins(String cluster) {
+    @GetMapping("/{version}/deploy-preview")
+    public ResponseEntity<Map<String, Object>> deployPreview(
+            @PathVariable String version,
+            @RequestParam String cluster,
+            @RequestParam(defaultValue = "auto") String baseline) {
+
+        Map<String, Object> preview = helmReleaseService.getDeployPreview(cluster, version, baseline);
+        if (preview.containsKey("error")) {
+            return ResponseEntity.badRequest().body(preview);
+        }
+        return ResponseEntity.ok(preview);
+    }
+
+    @GetMapping("/{version}/rollback-options")
+    public ResponseEntity<Map<String, Object>> rollbackOptions(
+            @PathVariable String version,
+            @RequestParam String cluster) {
+
+        return ResponseEntity.ok(helmReleaseService.getRollbackOptions(cluster, version));
+    }
+
+    @PostMapping("/{version}/rollback")
+    public ResponseEntity<?> rollbackRelease(
+            @PathVariable String version,
+            @RequestParam String cluster,
+            @RequestParam(defaultValue = "version") String mode,
+            @RequestParam(required = false) String targetVersion) {
+
+        if ("revision".equalsIgnoreCase(mode)) {
+            HelmRelease deployed = helmReleaseService.getDeployedFromCluster(cluster, version);
+            if (deployed == null) {
+                return ResponseEntity.badRequest()
+                        .body(Map.of("error", "No deployed Helm release found for version " + version));
+            }
+
+            deployed.setStatus("deploying");
+            helmReleaseService.updateHelmRelease(cluster, version, deployed);
+            wsHandler.broadcast("status_changed",
+                    Map.of("version", version, "status", "deploying", "cluster", cluster));
+
+            try {
+                String valuesFileName = gitOpsService.resolveValuesFileName(deployed);
+                triggerJenkins(cluster, "helm-rollback", version, valuesFileName);
+                return ResponseEntity.ok(Map.of(
+                        "message", "Helm revision rollback triggered for v" + version,
+                        "version", version,
+                        "cluster", cluster,
+                        "mode", "revision"
+                ));
+            } catch (Exception e) {
+                deployed.setStatus("failed");
+                helmReleaseService.updateHelmRelease(cluster, version, deployed);
+                wsHandler.broadcast("status_changed",
+                        Map.of("version", version, "status", "failed", "cluster", cluster));
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                        .body(Map.of("error", e.getMessage()));
+            }
+        }
+
+        String target = StringUtils.hasText(targetVersion)
+                ? targetVersion
+                : helmReleaseService.getPreviousDeployedVersion(cluster, version).orElse(null);
+
+        if (!StringUtils.hasText(target)) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "No previous deployed version available to roll back to"));
+        }
+
+        if (helmReleaseService.getDeployedFromCluster(cluster, target) == null) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "Target version " + target + " is not deployed on cluster " + cluster));
+        }
+
+        HelmRelease targetRelease = helmReleaseService.getDeployedFromCluster(cluster, target);
+        targetRelease.setStatus("deploying");
+        helmReleaseService.updateHelmRelease(cluster, target, targetRelease);
+        wsHandler.broadcast("status_changed",
+                Map.of("version", target, "status", "deploying", "cluster", cluster));
+
+        try {
+            String valuesFileName = gitOpsService.resolveValuesFileName(targetRelease);
+            triggerJenkins(cluster, "rollback", target, valuesFileName);
+            return ResponseEntity.ok(Map.of(
+                    "message", "Rollback to v" + target + " triggered on " + cluster,
+                    "version", target,
+                    "cluster", cluster,
+                    "mode", "version"
+            ));
+        } catch (Exception e) {
+            targetRelease.setStatus("failed");
+            helmReleaseService.updateHelmRelease(cluster, target, targetRelease);
+            wsHandler.broadcast("status_changed",
+                    Map.of("version", target, "status", "failed", "cluster", cluster));
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    private void triggerJenkins(String cluster, String action, String chartVersion, String valuesFile) {
 
         if (!StringUtils.hasText(jenkinsUser) || !StringUtils.hasText(jenkinsToken)) {
             throw new IllegalStateException("Jenkins credentials are not configured (JENKINS_USER/JENKINS_TOKEN)");
@@ -313,7 +411,7 @@ public class HelmReleaseController {
             String auth = jenkinsUser + ":" + jenkinsToken;
             String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
 
-            // 🔹 Step 1: Get Crumb
+            
             String crumbUrl = jenkinsUrl + "/crumbIssuer/api/json";
 
             HttpHeaders crumbHeaders = new HttpHeaders();
@@ -333,23 +431,33 @@ public class HelmReleaseController {
 
             log.info("Fetched Jenkins crumb");
 
-            // 🔹 Step 2: Build URL
-            String url = UriComponentsBuilder
+            
+            UriComponentsBuilder urlBuilder = UriComponentsBuilder
                     .fromHttpUrl(jenkinsUrl)
                     .pathSegment("job", jenkinsJob, "buildWithParameters")
                     .queryParam("CLUSTER", cluster)
-                    .toUriString();
+                    .queryParam("ACTION", action)
+                    .queryParam("ALLOW_DEPLOY", "yes");
+
+            if (StringUtils.hasText(chartVersion)) {
+                urlBuilder.queryParam("CHART_VERSION", chartVersion);
+            }
+            if (StringUtils.hasText(valuesFile)) {
+                urlBuilder.queryParam("VALUES_FILE", valuesFile);
+            }
+
+            String url = urlBuilder.toUriString();
 
             log.info("Triggering Jenkins URL: {}", url);
 
-            // 🔹 Step 3: Headers
+            
             HttpHeaders headers = new HttpHeaders();
             headers.set("Authorization", "Basic " + encodedAuth);
             headers.set(crumbField, crumb);
 
             HttpEntity<String> request = new HttpEntity<>(headers);
 
-            // 🔹 Step 4: Trigger
+          
             ResponseEntity<String> response = restTemplate.exchange(
                     url,
                     HttpMethod.POST,

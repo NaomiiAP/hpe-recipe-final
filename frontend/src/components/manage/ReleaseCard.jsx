@@ -9,6 +9,8 @@ import {
   inputStyle,
 } from '../../ui/styles';
 import EditRecipeInline from './EditRecipeInline';
+import DeployPreviewModal from './DeployPreviewModal';
+import RollbackModal from './RollbackModal';
 import { normalizeRecipeDescription, getRecipeUpgradeFrom, getRecipeUpgradeTo } from './utils';
 
 const API_BASE = '/api';
@@ -20,6 +22,8 @@ export default function ReleaseCard({ release, onDeploy, cluster, onRefresh, onN
   const [detail, setDetail] = useState(null);
   const [editingRecipe, setEditingRecipe] = useState(null);
   const [editingCatalog, setEditingCatalog] = useState(false);
+  const [showDeployPreview, setShowDeployPreview] = useState(false);
+  const [showRollback, setShowRollback] = useState(false);
   const [catalogDraft, setCatalogDraft] = useState({
     releaseName: '',
     catalogName: '',
@@ -168,13 +172,8 @@ export default function ReleaseCard({ release, onDeploy, cluster, onRefresh, onN
     : displayStatus === 'deploying' ? T.blue
     : T.yellow;
 
-  const handleDeploy = async () => {
-    if (!window.confirm(`Deploy Helm release ${release.version}? This will push to Git and trigger Jenkins.`)) return;
-    try {
-      await onDeploy(release.version);
-    } catch (err) {
-      onNotify(err.message || 'Deploy failed', true);
-    }
+  const handleDeploy = () => {
+    setShowDeployPreview(true);
   };
 
   return (
@@ -218,9 +217,20 @@ export default function ReleaseCard({ release, onDeploy, cluster, onRefresh, onN
             ...btnSecondary, padding: '6px 14px', fontSize: 12,
           }}>Edit Catalog</button>
           {displayStatus !== 'deploying' && (
-            <button onClick={handleDeploy} style={{
-              ...btnPrimary, padding: '6px 14px', fontSize: 12,
-            }}>Deploy</button>
+            <>
+              <button onClick={handleDeploy} style={{
+                ...btnSecondary, padding: '6px 14px', fontSize: 12,
+              }}>Preview</button>
+              <button onClick={handleDeploy} style={{
+                ...btnPrimary, padding: '6px 14px', fontSize: 12,
+              }}>Deploy</button>
+            </>
+          )}
+          {(displayStatus === 'deployed' || displayStatus === 'failed') && (
+            <button onClick={() => setShowRollback(true)} style={{
+              ...btnSecondary, padding: '6px 14px', fontSize: 12,
+              color: T.yellow, borderColor: `${T.yellow}55`,
+            }}>Rollback</button>
           )}
           {displayStatus === 'deploying' && (
             <span style={{
@@ -475,6 +485,25 @@ export default function ReleaseCard({ release, onDeploy, cluster, onRefresh, onN
             </div>
           </div>
         </div>
+      )}
+
+      {showDeployPreview && (
+        <DeployPreviewModal
+          version={release.version}
+          cluster={cluster}
+          onClose={() => setShowDeployPreview(false)}
+          onConfirm={onDeploy}
+        />
+      )}
+
+      {showRollback && (
+        <RollbackModal
+          version={release.version}
+          cluster={cluster}
+          onClose={() => setShowRollback(false)}
+          onRollback={onRefresh}
+          onNotify={onNotify}
+        />
       )}
     </div>
   );

@@ -9,6 +9,8 @@ data:
   recipe-data.json: |
     {{- $data := dict
         "chartVersion" .Values.recipeData.chartVersion
+        "target_cluster" (default "" .Values.recipeData.target_cluster)
+        "values_file" (default "" .Values.recipeData.values_file)
         "catalog_name" (default "" .Values.recipeData.catalog_name)
         "catalog_description" (default "" .Values.recipeData.catalog_description)
         "release_date" (default "" .Values.recipeData.release_date)

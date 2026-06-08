@@ -82,7 +82,6 @@ export default function ManagePage() {
 
     const message = payload.message || `Deploy triggered for ${version} on ${cluster.toUpperCase()}`;
     notify(message);
-    window.alert(message);
     refresh();
     return payload;
   }

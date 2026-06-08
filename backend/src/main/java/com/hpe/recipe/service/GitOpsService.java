@@ -58,14 +58,14 @@ public class GitOpsService {
                     .call();
 
             System.out.println("📄 Generating YAML...");
-            String valuesYaml = generateValuesYaml(release);
-            String valuesFileName = "values-v" + release.getVersion() + ".yaml";
+            String valuesFileName = resolveValuesFileName(release);
+            String valuesYaml = generateValuesYaml(release, valuesFileName);
             File valuesFile = new File(repoDir, valuesDir + "/" + valuesFileName);
             writeFile(valuesFile, valuesYaml);
 
             System.out.println("📝 Updating Chart.yaml...");
             File chartFile = new File(repoDir, valuesDir + "/Chart.yaml");
-            updateChartVersion(chartFile, release.getVersion());
+            updateChartMetadata(chartFile, release.getVersion(), valuesFileName);
 
             System.out.println("➕ Adding files to git...");
             git.add().addFilepattern(valuesDir + "/" + valuesFileName).call();
@@ -128,7 +128,18 @@ public class GitOpsService {
     *       upgrade_to:
      *         - "1.5.0"
      */
-    String generateValuesYaml(HelmRelease release) {
+    public String resolveValuesFileName(HelmRelease release) {
+        if (release.getValuesFileName() != null && !release.getValuesFileName().isBlank()) {
+            String custom = release.getValuesFileName().trim().replace("\\", "/");
+            if (custom.contains("..") || custom.startsWith("/")) {
+                throw new IllegalArgumentException("Invalid values file name: " + release.getValuesFileName());
+            }
+            return custom.endsWith(".yaml") ? custom : custom + ".yaml";
+        }
+        return "values-v" + release.getVersion() + ".yaml";
+    }
+
+    String generateValuesYaml(HelmRelease release, String valuesFileName) {
         DumperOptions options = new DumperOptions();
         options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
         options.setPrettyFlow(true);
@@ -194,6 +205,9 @@ public class GitOpsService {
 
         Map<String, Object> recipeData = new LinkedHashMap<>();
         recipeData.put("chartVersion", quote(release.getVersion()));
+        if (release.getCluster() != null && !release.getCluster().isBlank()) {
+            recipeData.put("target_cluster", quote(release.getCluster()));
+        }
         if (release.getCatalogName() != null && !release.getCatalogName().isBlank()) {
             recipeData.put("catalog_name", quote(release.getCatalogName()));
         }
@@ -209,6 +223,7 @@ public class GitOpsService {
         if (release.getMaintainer() != null && !release.getMaintainer().isBlank()) {
             recipeData.put("maintainer", quote(release.getMaintainer()));
         }
+        recipeData.put("values_file", quote(valuesFileName));
         recipeData.put("recipes", recipeMaps);
 
         Map<String, Object> root = new LinkedHashMap<>();
@@ -237,10 +252,22 @@ public class GitOpsService {
         return quoted;
     }
 
-    private void updateChartVersion(File chartFile, String version) throws IOException {
+    private void updateChartMetadata(File chartFile, String version, String valuesFileName) throws IOException {
         String content = Files.readString(chartFile.toPath());
-        content = content.replaceAll("version:\\s*.+", "version: " + version);
-        content = content.replaceAll("appVersion:\\s*.+", "appVersion: \"" + version + "\"");
+        content = content.replaceAll("(?m)^version:\\s*.+", "version: " + version);
+        content = content.replaceAll("(?m)^appVersion:\\s*.+", "appVersion: \"" + version + "\"");
+
+        String annotationLine = "  recipe-detection/values-file: " + valuesFileName;
+        if (content.contains("recipe-detection/values-file:")) {
+            content = content.replaceAll(
+                    "(?m)^\\s*recipe-detection/values-file:\\s*\\S+",
+                    annotationLine.trim());
+        } else if (content.contains("annotations:")) {
+            content = content.replaceFirst("annotations:", "annotations:\n" + annotationLine);
+        } else {
+            content = content.trim() + "\nannotations:\n" + annotationLine + "\n";
+        }
+
         writeFile(chartFile, content);
     }
 

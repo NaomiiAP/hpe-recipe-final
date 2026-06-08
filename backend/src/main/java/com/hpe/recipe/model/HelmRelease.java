@@ -8,7 +8,7 @@ public class HelmRelease {
     private String version;
     private String releaseName;
     private String status;
-    private String cluster;   // 🔥 NEW FIELD
+    private String cluster;   
     @JsonProperty("catalog_name")
     private String catalogName;
     @JsonProperty("catalog_description")
@@ -18,6 +18,7 @@ public class HelmRelease {
     @JsonProperty("catalog_status")
     private String catalogStatus;
     private String maintainer;
+    private String valuesFileName;
     private List<Recipe> recipes;
 
     public HelmRelease() {}
@@ -75,6 +76,9 @@ public class HelmRelease {
 
     public String getMaintainer() { return maintainer; }
     public void setMaintainer(String maintainer) { this.maintainer = maintainer; }
+
+    public String getValuesFileName() { return valuesFileName; }
+    public void setValuesFileName(String valuesFileName) { this.valuesFileName = valuesFileName; }
 
     public List<Recipe> getRecipes() { return recipes; }
     public void setRecipes(List<Recipe> recipes) { this.recipes = recipes; }

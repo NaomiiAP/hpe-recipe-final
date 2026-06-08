@@ -24,6 +24,7 @@ const readVersion = (spec) => (typeof spec === 'string' ? spec : (spec?.version 
 
 export default function CreateReleaseForm({ cluster, onCreated }) {
   const [version, setVersion] = useState('');
+  const [valuesFileName, setValuesFileName] = useState('');
   const [releaseName, setReleaseName] = useState('');
   const [catalogName, setCatalogName] = useState('');
   const [catalogDescription, setCatalogDescription] = useState('');
@@ -452,6 +453,7 @@ export default function CreateReleaseForm({ cluster, onCreated }) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         version: version.trim(),
+        ...(valuesFileName.trim() ? { valuesFileName: valuesFileName.trim() } : {}),
         releaseName: releaseName.trim() || autoReleaseName,
         status: 'pending',
         catalog_name: catalogName.trim(),
@@ -472,7 +474,7 @@ export default function CreateReleaseForm({ cluster, onCreated }) {
         return r.json();
       })
       .then(() => {
-        setVersion(''); setReleaseName('');
+        setVersion(''); setValuesFileName(''); setReleaseName('');
         setCatalogName('');
         setCatalogDescription('');
         setCatalogReleaseDate('');
@@ -497,6 +499,15 @@ export default function CreateReleaseForm({ cluster, onCreated }) {
           <label style={labelStyle}>Chart Version</label>
           <input style={inputStyle} placeholder="e.g. 0.0.4" value={version}
             onChange={(e) => setVersion(e.target.value)} required />
+        </div>
+        <div>
+          <label style={labelStyle}>Values File Name (optional)</label>
+          <input
+            style={inputStyle}
+            placeholder={version.trim() ? `values-v${version.trim()}.yaml` : 'e.g. prod-values.yaml'}
+            value={valuesFileName}
+            onChange={(e) => setValuesFileName(e.target.value)}
+          />
         </div>
         <div>
           <label style={labelStyle}>Catalog Name</label>

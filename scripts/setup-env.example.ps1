@@ -1,5 +1,5 @@
 # Copy this file to setup-env.ps1 and fill in your tokens.
-# setup-env.ps1 is gitignored — never commit real credentials.
+# setup-env.ps1 is gitignored - never commit real credentials.
 
 $env:GIT_USERNAME = "NaomiiAP"
 $env:GIT_TOKEN    = "your-github-personal-access-token"
